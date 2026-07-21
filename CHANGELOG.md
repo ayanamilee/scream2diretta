@@ -6,7 +6,60 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased]
+## [0.7.0] - 2026-07-21
+
+### Summary
+
+Architecture-hardening release: removes the unused legacy output/input backends,
+fixes long-term drift and lifecycle races introduced during refactoring, and
+aligns all documentation with the current two-thread SPSC architecture.
+
+### Changed
+
+- **Remove legacy backends** inherited from the upstream Unix scream receiver:
+  PulseAudio, ALSA, JACK, sndio output backends and the libpcap/shared-memory
+  input backends are deleted. Only `raw` (diagnostic) and `diretta` (production)
+  outputs remain, plus `unicast`/`multicast` UDP inputs. (`scream.c`,
+  `scream.h`, `CMakeLists.txt`, `config.h.in`, `shell.nix`)
+- **Version bump to 0.7.0** across `CMakeLists.txt`, `README.md`,
+  `README_CN.md`, and the fallback `SCREAM2DIRETTA_VERSION` macro.
+
+### Fixed
+
+- **Fractional-frame drift in `getNewStream()`**. `Sync::getCycleSize()` is not
+  guaranteed to be a whole multiple of `bytesPerFrame`. Truncating every cycle
+  caused a long-term speed bias and periodic ring drops. s2d now keeps a
+  per-Sync remainder accumulator and adds one extra frame whenever accumulated
+  truncated bytes reach a full frame, preserving the SDK's intended long-term
+  bytes-per-cycle without changing cycle timing. (`diretta_sync.h`,
+  `diretta_sync.cpp`)
+- **Eliminate hot-path `std::vector::resize()` in frame conversion**. Fixed
+  scratch buffers (`dsd_transform_buffer`, `pcm_pack_buffer`) are preallocated
+  in `diretta_output_init()` and reused; `queue_push_frames_converted()` no
+  longer allocates on the receiver thread. (`diretta.cpp`, `diretta.h`)
+- **Async worker no longer reads mutable global format state**. Worker
+  signatures (`open_sync_worker_blocking()`, `apply_transfer_mode()`) now
+  receive explicit format scalars, eliminating a latent race where a background
+  thread could observe stale or changing `g_st` fields. (`diretta.cpp`)
+- **Exception safety in async cleanup**. `cleanup_sync_async()` wraps the
+  cleanup lambda in `try/catch` so an exception cannot terminate the process or
+  leave `g_inflight_cleanups` permanently incremented. (`diretta.cpp`)
+- **Rate/DoS caps on derived format parameters**. Sample-rate multiplier is
+  capped at 16×, DSD multiplier at power-of-two ≤8, and ring size at 256 MiB.
+  (`diretta.cpp`)
+- **`CPU_SETSIZE` visibility on Linux**. Added `#define _GNU_SOURCE` at the top
+  of `scream.c` so CPU affinity validation compiles after legacy backend
+  includes were removed. (`scream.c`)
+
+### Documentation
+
+- Rewrote stale sections in `ARCHITECTURE_RISKS.md`, `ARCH_COMPARISON.md`,
+  `PARAMETERS.md`, `Q&A.md`, `TODO.md`, `.claude/CLAUDE.md`, and
+  `docs/diretta-alsa-vs-direct-sdk.md` to reflect: removed backends,
+  consumer-side `RingUserGuard` + `deactivate()` reconfig protocol,
+  `--cpu-scream`/`--cpu-audio`/`--cpu-other`, `autofix` transfer mode, and the
+  6-byte ScreamALSA header layout.
+- Removed outdated backend references in `CHANGELOG.md` 0.6.0 entry.
 
 ---
 
@@ -24,8 +77,7 @@ available via `-L` for ap2renderer / ASIOScream / old scream-alsa.
 - **Extended 6-byte ScreamALSA header support**. `sample_rate` is decoded from
 the new byte[0] + byte[4] rate encoding, the `wire_layout` byte (byte[5])
 exposes `S24_3LE` vs `S24_LE`, and `scream_bytes_per_sample()` returns the
-correct on-wire size for each format. (`scream.h`, `network.c`, all output
-backends)
+correct on-wire size for each format. (`scream.h`, `network.c`, `diretta.cpp`)
 
 - **S24_LE → S24_3LE packing on ingress**. Diretta SDK only exposes packed
 `FMT_PCM_SIGNED_24`. When the sender signals `wire_layout = 1` (4-byte
@@ -36,13 +88,12 @@ bit-perfect. (`diretta.cpp`, `diretta_ring.h`)
 - **`--legacy` / `-L` switch** to receive the original 5-byte Scream header.
 Legacy rate decoding and legacy DSD byte-interleave reversal are handled in
 `network.c`; the Diretta backend then sees standard ALSA `DSD_U32_BE`
-word-interleaved data. (`scream.c`, `network.c`, `network.h`, `pcap_input.c`)
+word-interleaved data. (`scream.c`, `network.c`, `network.h`)
 
-- **DSD support across all receiver outputs** (`alsa`, `raw`, `pulseaudio`,
-`jack`, `sndio`, `pcap`, `shmem`). Each backend now uses the decoded Hz
-`sample_rate` and handles `sample_size == 1` as DSD where applicable.
-(`alsa.c`, `raw.c`, `pulseaudio.c`, `jack.c`, `sndio.c`, `pcap_input.c`,
-`shmem.c`)
+- **DSD support in the Diretta output path**. The Diretta backend now handles
+`sample_size == 1` as native DSD (FMT_DSD1) up to DSD512, and the raw
+diagnostic output passes the decoded DSD_U32_BE bytes through unchanged.
+(`diretta.cpp`, `diretta_sync.cpp`, `raw.c`)
 
 ### Changed
 

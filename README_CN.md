@@ -1,6 +1,6 @@
 # scream2diretta
 
-**v0.6** · 原生 **Scream UDP → Diretta SDK** 桥接器，适用于 Linux (aarch64, x86-64)。
+**v0.7** · 原生 **Scream UDP → Diretta SDK** 桥接器，适用于 Linux (aarch64, x86-64)。
 
 通过网络 UDP 接收来自远程机器（运行 ASIOScream / ScreamDriver / scream-alsa）的连续无压缩 PCM 流，并直接通过 Diretta Host SDK 转发到支持 Diretta 的 DAC —— **无需 ALSA、FFmpeg、UPnP 或任何中间软件层**。
 
@@ -153,20 +153,19 @@ mkdir build && cd build
 cmake -DDIRETTA_ENABLE=ON -DDIRETTA_SDK_ROOT=../DirettaHostSDK_149 ..
 make -j$(nproc)
 
-# 完整编译 (指定架构、静态链接、关闭 SDK 日志)
+# 完整编译 (指定架构、关闭 SDK 日志)
 cmake -DDIRETTA_ENABLE=ON \
       -DDIRETTA_SDK_ROOT=../DirettaHostSDK_149 \
       -DDIRETTA_ARCH_SUFFIX=aarch64-linux-15k16 \
-      -DBUILD_STATIC=ON \
-      -DNOLOG=1 \
+      -DDIRETTA_NOLOG=ON \
       ..
 make -j$(nproc)
 ```
 
 ### 架构变体
 
-| `ARCH_NAME` | 平台 |
-|-------------|------|
+| `DIRETTA_ARCH_SUFFIX` | 平台 |
+|-----------------------|------|
 | `x64-linux-15v2` | x86-64 基线 (无 AVX2) |
 | `x64-linux-15v3` | x86-64 AVX2 (默认) |
 | `x64-linux-15v4` | x86-64 AVX-512 |
@@ -177,7 +176,7 @@ make -j$(nproc)
 | `*-musl*` | musl libc 变体 (如 `aarch64-linux-15-musl`) |
 | `*-nolog` | 禁用 SDK 内部日志 (附加到任意变体) |
 
-#### 如何确定你的 `ARCH_NAME`
+#### 如何确定你的 `DIRETTA_ARCH_SUFFIX`
 
 **x86-64:**
 ```bash
@@ -197,9 +196,11 @@ getconf PAGE_SIZE
 
 **musl libc:** 如果你的系统使用 musl 而非 glibc (如 Alpine Linux)，在基础变体后附加 `-musl`。
 
-**生产构建:** 附加 `-nolog` 以禁用 SDK 内部日志 (如 `aarch64-linux-15-nolog`)。
+**生产构建:** 附加 `-nolog` 以禁用 SDK 内部日志 (如 `aarch64-linux-15-nolog`)，或传入 `-DDIRETTA_NOLOG=ON`。
 
-输出：`scream2diretta-<ARCH_NAME>[-static]`
+**静态链接:** CMake 默认生成动态链接可执行文件。如需完全静态链接的二进制，请设置 `LDFLAGS` 或使用 `scripts/install.sh --full`，该脚本会处理静态链接并剥离二进制。
+
+输出：`scream2diretta-<DIRETTA_ARCH_SUFFIX>` (例如 `scream2diretta-aarch64-linux-15k16`)
 
 ---
 

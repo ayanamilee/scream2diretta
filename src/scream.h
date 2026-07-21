@@ -5,11 +5,11 @@
 #include <signal.h>
 
 enum receiver_type {
-  Unicast, Multicast, SharedMem, Pcap
+  Unicast, Multicast
 };
 
 enum output_type {
-  Raw, Alsa, Pulseaudio, Jack, Sndio, Diretta
+  Raw, Diretta
 };
 
 #define SCREAM_SUPPORTED_CHANNELS 2

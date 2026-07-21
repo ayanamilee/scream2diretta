@@ -68,6 +68,12 @@ constexpr uint8_t DSD_SILENCE_BYTE = 0x69;
 constexpr int DSD_BUFFER_MS_DEFAULT = 1500;
 constexpr int DSD_PREFILL_MS_DEFAULT = 200;
 
+// Maximum Scream packet payload we ever expect on the wire. Even with jumbo
+// frames the UDP payload stays well below this; we use a fixed upper bound so
+// the DSD and 24-bit transform scratch buffers can be allocated once in init
+// and never resized on the audio hot path.
+constexpr size_t SCREAM_MAX_PACKET_BYTES = 65536;
+
 struct DirettaState {
     bool initialized = false;
     bool sdk_open = false;
@@ -120,22 +126,29 @@ struct DirettaState {
     uint32_t dsd_multiplier = 0;   // 1=DSD64, 2=DSD128, 4=DSD256, 8=DSD512
     uint32_t dsd_real_rate = 0;    // e.g. 2822400 for DSD64
 
-    // DSD transformation flags. The Scream receiver (network.c, pcap_input.c,
-    // shmem.c) is required to deliver DSD in standard ALSA DSD_U32_BE word-
+    // DSD transformation flags. The Scream receiver (network.c)
+    // is required to deliver DSD in standard ALSA DSD_U32_BE word-
     // interleaved order; the legacy network path (-L) performs the original
     // byte-interleaved -> word-interleaved conversion if needed. This backend
     // only applies the sink-dependent bit-order / byte-order transforms.
     // ALSA DSD_U32_BE convention places the DSD bit in the MSB (bit 7) of each
     // byte, i.e. MSB-first / big-endian.
-    bool dsd_needs_bit_reverse = false;
-    bool dsd_needs_byte_swap = false;
-    std::vector<uint8_t> dsd_transform_buffer; // scratch for DSD transform
+    // Atomic because the receiver thread reads these on every DSD packet while
+    // the async open worker negotiates/writes them; the receiver must never see
+    // a torn or mixed transform.
+    std::atomic<bool> dsd_needs_bit_reverse{false};
+    std::atomic<bool> dsd_needs_byte_swap{false};
+    // Staging fields written by the async open worker, committed to the live
+    // globals in finalize_sync_open_on_receiver() (receiver thread only).
+    std::atomic<bool> async_open_dsd_needs_bit_reverse{false};
+    std::atomic<bool> async_open_dsd_needs_byte_swap{false};
+    std::vector<uint8_t> dsd_transform_buffer; // scratch for DSD transform (fixed size, allocated once in init)
 
     // PCM format conversion state.
     // Diretta SDK has no native S24_LE (4-byte container); screamalsa sends
     // S24_LE when wire_layout == 1, so we pack it to S24_3LE (3-byte) on ingress.
     bool pcm_needs_pack_24 = false;
-    std::vector<uint8_t> pcm_pack_buffer; // scratch for S24_LE -> S24_3LE
+    std::vector<uint8_t> pcm_pack_buffer; // scratch for S24_LE -> S24_3LE (fixed size, allocated once in init)
 
     // Cached cycle values from the last successful open, for stats output.
     uint64_t target_cycle_us = 0;
@@ -596,20 +609,15 @@ static FormatID rate_base_id(uint32_t base) {
 }
 
 static FormatID rate_mult_id(uint32_t mult) {
+    // Cap PCM sample-rate multiples to 16x (768 kHz). Higher wire values are
+    // not realistic Scream sources and were an easy DoS vector: a crafted
+    // header could force a multi-gigabyte ring allocation.
     switch (mult) {
         case 1:    return FormatID::RAT_MP1;
         case 2:    return FormatID::RAT_MP2;
         case 4:    return FormatID::RAT_MP4;
         case 8:    return FormatID::RAT_MP8;
         case 16:   return FormatID::RAT_MP16;
-        case 32:   return FormatID::RAT_MP32;
-        case 64:   return FormatID::RAT_MP64;
-        case 128:  return FormatID::RAT_MP128;
-        case 256:  return FormatID::RAT_MP256;
-        case 512:  return FormatID::RAT_MP512;
-        case 1024: return FormatID::RAT_MP1024;
-        case 2048: return FormatID::RAT_MP2048;
-        case 4096: return FormatID::RAT_MP4096;
         default:   return FormatID::NONE;
     }
 }
@@ -651,13 +659,18 @@ static bool build_dsd_format(const receiver_format_t& rf, FormatConfigure& out_f
                              uint32_t* out_bits, uint32_t* out_bpf,
                              uint32_t* out_dsd_multiplier, uint32_t* out_dsd_real_rate) {
     // map_rate runs on the halved wire value: base must be 44100/48000 and the
-    // multiplier (DSD64=1, DSD128=2, ...) is derived from it directly.
+    // multiplier (DSD64=1, DSD128=2, DSD256=4, DSD512=8) is derived from it.
+    // Reject non-power-of-two or out-of-range multipliers; they are not valid
+    // DSD rates and were an easy DoS vector for huge ring allocations.
     uint32_t base = 0, mult = 0;
     map_rate(rf.sample_rate, &base, &mult);
     if (base != 44100u && base != 48000u) return false;
     if (mult == 0) mult = 1;
+    if (mult > 8u || (mult & (mult - 1)) != 0) return false;
     const uint32_t container_rate = rf.sample_rate * 2u;
-    const uint32_t dsd_real_rate = container_rate * 32u;
+    const uint64_t dsd_real_rate64 = static_cast<uint64_t>(container_rate) * 32u;
+    if (dsd_real_rate64 > 0xFFFFFFFFu) return false;
+    const uint32_t dsd_real_rate = static_cast<uint32_t>(dsd_real_rate64);
     const uint32_t bpf = rf.channels * 4u;
     FormatID ch = channel_id(rf.channels);
     if (ch == FormatID::NONE) return false;
@@ -934,6 +947,10 @@ static unsigned int calculateCycleTime(uint32_t sampleRate,
 // AUTO branch decision).
 static const char* apply_transfer_mode(Sync& sb,
                                        const diretta_config_t& cfg,
+                                       uint32_t sample_rate,
+                                       uint32_t channels,
+                                       uint32_t bits_per_sample,
+                                       bool is_dsd,
                                        unsigned int& out_effective_cycle_us) {
     const uint32_t effective_mtu = cfg.mtu_override > 0
         ? static_cast<uint32_t>(cfg.mtu_override)
@@ -941,9 +958,9 @@ static const char* apply_transfer_mode(Sync& sb,
     // varmax_cycle = cycle time that exactly fills one effMtu packet at the
     // current format. Used both as the auto-default cycle and as the
     // "1 packet per cycle" upper bound when the user gives an explicit cycle.
-    const unsigned int varmax_cycle = calculateCycleTime(g_st.sample_rate,
-                                                         g_st.channels,
-                                                         g_st.bits_per_sample,
+    const unsigned int varmax_cycle = calculateCycleTime(sample_rate,
+                                                         channels,
+                                                         bits_per_sample,
                                                          effective_mtu,
                                                          g_st.inferred_overhead);
     const unsigned int cycle_us = (cfg.cycle_us > 0) ? cfg.cycle_us : varmax_cycle;
@@ -963,7 +980,7 @@ static const char* apply_transfer_mode(Sync& sb,
     if (cfg.cycle_us > 0 && cfg.cycle_us < 200u) {
         DLOG(0, "[warn] cycle_time_us=%u < 200us is below typical target "
                 "capability; sound may be unstable (format=%uHz/%ubit/%uch)",
-             cfg.cycle_us, g_st.sample_rate, g_st.bits_per_sample, g_st.channels);
+             cfg.cycle_us, sample_rate, bits_per_sample, channels);
     }
 
     if (cfg.target_profile_limit_us > 0) {
@@ -1041,18 +1058,18 @@ static const char* apply_transfer_mode(Sync& sb,
                             "limit (varmax_cycle=%u, safe_max=%u) at "
                             "%uHz/%ubit/%uch; falling back to varmax",
                          cycle_us, varmax_cycle, safe_max,
-                         g_st.sample_rate, g_st.bits_per_sample, g_st.channels);
+                         sample_rate, bits_per_sample, channels);
                     sb.configTransferVarMax(Clock::MicroSeconds(varmax_cycle));
                     out_effective_cycle_us = varmax_cycle;
                     return "autofix-varmax-override";
                 }
             }
             // cfg.cycle_us == 0: identical to AUTO B-branch.
-            const bool isLowBitrate = (g_st.bits_per_sample <= 16
-                                       && g_st.sample_rate <= 48000);
-            if (isLowBitrate || g_st.is_dsd) {
+            const bool isLowBitrate = (bits_per_sample <= 16
+                                       && sample_rate <= 48000);
+            if (isLowBitrate || is_dsd) {
                 sb.configTransferVarAuto(cycle);
-                return g_st.is_dsd ? "autofix-varauto-dsd" : "autofix-varauto";
+                return is_dsd ? "autofix-varauto-dsd" : "autofix-varauto";
             } else {
                 sb.configTransferVarMax(cycle);
                 return "autofix-varmax";
@@ -1093,7 +1110,7 @@ static const char* apply_transfer_mode(Sync& sb,
                             "limit (varmax_cycle=%u, safe_max=%u) at "
                             "%uHz/%ubit/%uch; falling back to varmax",
                          cycle_us, varmax_cycle, safe_max,
-                         g_st.sample_rate, g_st.bits_per_sample, g_st.channels);
+                         sample_rate, bits_per_sample, channels);
                     sb.configTransferVarMax(Clock::MicroSeconds(varmax_cycle));
                     out_effective_cycle_us = varmax_cycle;
                     return "auto-varmax-override";
@@ -1102,11 +1119,11 @@ static const char* apply_transfer_mode(Sync& sb,
             // cfg.cycle_us == 0 path (original auto policy: low-bitrate/DSD →
             // VarAuto, normal/high-rate PCM → VarMax). out_effective_cycle_us
             // is already set to cycle_us (=varmax_cycle) at function entry.
-            const bool isLowBitrate = (g_st.bits_per_sample <= 16
-                                       && g_st.sample_rate <= 48000);
-            if (isLowBitrate || g_st.is_dsd) {
+            const bool isLowBitrate = (bits_per_sample <= 16
+                                       && sample_rate <= 48000);
+            if (isLowBitrate || is_dsd) {
                 sb.configTransferVarAuto(cycle);
-                return g_st.is_dsd ? "auto-varauto-dsd" : "auto-varauto";
+                return is_dsd ? "auto-varauto-dsd" : "auto-varauto";
             } else {
                 sb.configTransferVarMax(cycle);
                 return "auto-varmax";
@@ -1139,6 +1156,16 @@ static void configure_unified_queue(uint32_t sample_rate,
     if (ring_ms < 50)   ring_ms = 50;
     if (ring_ms > 5000) ring_ms = 5000;
     size_t ring_bytes = static_cast<size_t>((bps * static_cast<uint64_t>(ring_ms)) / 1000);
+    // Hard cap: a single Scream packet cannot legitimately require more than
+    // a few hundred MB, and uncapped sizing was a DoS vector (crafted rate
+    // forcing tens of GB). 256 MiB is generous for all real formats
+    // (DSD512 stereo ~23 MB/s * 5 s ~115 MB).
+    const size_t RING_BYTES_MAX = 256u * 1024u * 1024u;
+    if (ring_bytes > RING_BYTES_MAX) {
+        DLOG(0, "requested ring size %zu B exceeds cap %zu B; clamping",
+             ring_bytes, RING_BYTES_MAX);
+        ring_bytes = RING_BYTES_MAX;
+    }
     g_st.queue.resize(ring_bytes, silence_byte);
     g_st.queue_bpf = bytes_per_frame;
     g_st.queue_ready = true;
@@ -1463,9 +1490,16 @@ static inline void queue_push_frames_converted(const uint8_t* data, size_t bytes
     // converts original byte-interleaved DSD to this standard order. Here we
     // only apply the sink-dependent bit-order / byte-order transforms.
     if (g_st.is_dsd) {
-        g_st.dsd_transform_buffer.resize(bytes);
+        if (bytes > g_st.dsd_transform_buffer.size()) {
+            // Defensive: input larger than our fixed scratch buffer. Drop rather
+            // than allocate on the hot path; this should never happen in practice
+            // because Scream packets are bounded by the network MTU.
+            return;
+        }
+        const bool bit_reverse = g_st.dsd_needs_bit_reverse.load(std::memory_order_acquire);
+        const bool byte_swap   = g_st.dsd_needs_byte_swap.load(std::memory_order_acquire);
         dsd_transform(data, g_st.dsd_transform_buffer.data(), bytes, g_st.channels,
-                      g_st.dsd_needs_bit_reverse, g_st.dsd_needs_byte_swap);
+                      bit_reverse, byte_swap);
         queue_push_frames(g_st.dsd_transform_buffer.data(), bytes, dst_bpf);
         return;
     }
@@ -1477,7 +1511,11 @@ static inline void queue_push_frames_converted(const uint8_t* data, size_t bytes
         const size_t whole_frames = bytes / src_bpf;
         const size_t out_bytes = whole_frames * dst_bpf;
         if (out_bytes == 0) return;
-        g_st.pcm_pack_buffer.resize(out_bytes);
+        if (out_bytes > g_st.pcm_pack_buffer.size()) {
+            // Defensive: output larger than our fixed scratch buffer. Drop rather
+            // than allocate on the hot path.
+            return;
+        }
         pcm_pack_24le(data, g_st.pcm_pack_buffer.data(), whole_frames * src_bpf,
                       src_bpf, g_st.channels);
         queue_push_frames(g_st.pcm_pack_buffer.data(), out_bytes, dst_bpf);
@@ -1492,13 +1530,16 @@ static inline void queue_push_frames_converted(const uint8_t* data, size_t bytes
 // g_st.sync. On success the Sync is published via async_open_pending_sync.
 // On failure it is destroyed before the worker reports DoneFail.
 //
-// Inputs read by this worker are snapshotted before launch
-// (DirettaState::async_open_fc, and the immutable-during-open fields
-// cfg / sink_addr / mtu / sample_rate / channels / bits_per_sample). The
-// queue ring (g_st.queue) is shared with the receive thread and is
-// designed to be SPSC lock-free.
+// All format scalars are passed explicitly as snapshots so the worker does not
+// read mutable g_st fields while the receiver thread may be running.
 static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& out_sync,
-                                          const FormatConfigure& fc) {
+                                          const FormatConfigure& fc,
+                                          uint32_t sample_rate,
+                                          uint32_t channels,
+                                          uint32_t bits_per_sample,
+                                          bool is_dsd,
+                                          uint32_t dsd_real_rate,
+                                          uint32_t dsd_multiplier) {
     const diretta_config_t& cfg = g_st.cfg;
     auto* sync = new scream_diretta::ScreamDirettaSync();
     out_sync = nullptr;
@@ -1579,11 +1620,11 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
     // Format negotiation: PCM falls back to lower bit depths; DSD tries
     // the four common LSB/MSB × BIG/LITTLE combinations.
     uint32_t accepted_bits = 0;
-    if (g_st.is_dsd) {
+    if (is_dsd) {
         const char* dsd_mode_str = "unknown";
         FormatConfigure dsd_fc;
-        dsd_fc.setSpeed(g_st.dsd_real_rate);
-        dsd_fc.setChannel(g_st.channels);
+        dsd_fc.setSpeed(dsd_real_rate);
+        dsd_fc.setChannel(channels);
 
         struct DsdMode { FormatID fmt; const char* name; };
         const DsdMode dsd_modes[] = {
@@ -1638,19 +1679,19 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
         const bool target_is_little = (negotiated_dsd_fmt & FormatID::FMT_DSD_LITTLE) != FormatID(0);
         // If neither LSB nor MSB is set (FMT_DSD1 fallback), assume MSB.
         const bool target_wants_lsb = target_is_lsb;
-        g_st.dsd_needs_bit_reverse = target_wants_lsb; // source is MSB, LSB needs reversal
-        g_st.dsd_needs_byte_swap   = target_is_little; // source is BIG, LITTLE needs swap
+        g_st.async_open_dsd_needs_bit_reverse.store(target_wants_lsb, std::memory_order_release);
+        g_st.async_open_dsd_needs_byte_swap.store(target_is_little, std::memory_order_release);
         DLOG(1, "DSD format negotiated: %s (real_rate=%u Hz) transform: bit_reverse=%s byte_swap=%s",
-             dsd_mode_str, g_st.dsd_real_rate,
-             g_st.dsd_needs_bit_reverse ? "yes" : "no",
-             g_st.dsd_needs_byte_swap ? "yes" : "no");
+             dsd_mode_str, dsd_real_rate,
+             g_st.async_open_dsd_needs_bit_reverse.load(std::memory_order_relaxed) ? "yes" : "no",
+             g_st.async_open_dsd_needs_byte_swap.load(std::memory_order_relaxed) ? "yes" : "no");
         dbg_event("checkSinkSupport_return", "result=ok dsd_mode=%s", dsd_mode_str);
         dbg_event("setSinkConfigure_return", "result=ok dsd_mode=%s", dsd_mode_str);
     } else {
-        accepted_bits = negotiate_sink_format(sync, fc, g_st.bits_per_sample);
+        accepted_bits = negotiate_sink_format(sync, fc, bits_per_sample);
         if (accepted_bits == 0) {
             DLOG(0, "sink does not support any compatible PCM format (tried %u, 24, 16)",
-                 g_st.bits_per_sample);
+                 bits_per_sample);
             dbg_event("checkSinkSupport_return", "result=fail");
             sync->close();
             delete sync;
@@ -1659,7 +1700,7 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
         dbg_event("checkSinkSupport_return", "result=ok accepted_bits=%u", accepted_bits);
 
         // If negotiation kept the source format, we still need to call setSinkConfigure.
-        if (accepted_bits == g_st.bits_per_sample) {
+        if (accepted_bits == bits_per_sample) {
             dbg_event("setSinkConfigure_begin", "");
             if (!sync->setSinkConfigure(fc)) {
                 DLOG(0, "setSinkConfigure() failed");
@@ -1672,7 +1713,7 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
         } else {
             // negotiate_sink_format already called setSinkConfigure with the fallback format.
             dbg_event("setSinkConfigure_return", "result=ok auto_downgrade=%u->%u",
-                      g_st.bits_per_sample, accepted_bits);
+                      bits_per_sample, accepted_bits);
         }
     }
     // Pace the handshake after setSinkConfigure -- DRUP sleeps 100ms here.
@@ -1731,7 +1772,10 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
               (int)cfg.transfer_mode, cfg.cycle_us, cfg.cycle_min_us,
               cfg.info_cycle_us, cfg.target_profile_limit_us);
     unsigned int applied_cycle_us = 0;
-    const char* applied_mode = apply_transfer_mode(*sync, cfg, applied_cycle_us);
+    const char* applied_mode = apply_transfer_mode(*sync, cfg,
+                                                   sample_rate, channels,
+                                                   bits_per_sample, is_dsd,
+                                                   applied_cycle_us);
     if (dbg_on()) {
         dbg_event("sdk_cycle_info",
                   "getCycleTime_us=%lld getMinCycleTime_us=%lld getCycleSize=%zu getCyclePackets=%zu",
@@ -1830,10 +1874,10 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
     int prefill_ms = cfg.prefill_ms     > 0 ? cfg.prefill_ms     : 500;
     int mute_ms  = cfg.startup_mute_ms  > 0 ? cfg.startup_mute_ms  : 0;
     int real_delay_ms = cfg.startup_real_delay_ms > 0 ? cfg.startup_real_delay_ms : 0;
-    if (g_st.is_dsd) {
+    if (is_dsd) {
         ring_ms    = cfg.dsd_buffer_ms  > 0 ? cfg.dsd_buffer_ms  : DSD_BUFFER_MS_DEFAULT;
         prefill_ms = cfg.dsd_prefill_ms > 0 ? cfg.dsd_prefill_ms : DSD_PREFILL_MS_DEFAULT;
-        const uint32_t mult = g_st.dsd_multiplier > 1 ? g_st.dsd_multiplier : 1;
+        const uint32_t mult = dsd_multiplier > 1 ? dsd_multiplier : 1;
         mute_ms       = static_cast<int>(mute_ms * mult);
         real_delay_ms = static_cast<int>(real_delay_ms * mult);
         const int dsd_warmup = cfg.dsd_startup_warmup_ms > 0 ? cfg.dsd_startup_warmup_ms : 0;
@@ -1850,9 +1894,9 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
     tuning.startup_mute_ms  = mute_ms;
     tuning.startup_real_delay_ms = real_delay_ms;
     {
-        uint32_t bps = g_st.bits_per_sample / 8;
+        uint32_t bps = bits_per_sample / 8;
         if (bps == 0) bps = 1;
-        sync->configureFormat(g_st.sample_rate, g_st.channels, bps, tuning);
+        sync->configureFormat(sample_rate, channels, bps, tuning);
     }
     dbg_event("configureFormat_done",
               "ring_ms=%d prefill_ms=%d startup_queue_ms=%d startup_mute_ms=%d "
@@ -1862,7 +1906,7 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
               tuning.startup_mute_ms, tuning.startup_real_delay_ms,
               tuning.rebuffer_percent * 100.0f,
               tuning.underrun_rebuffer_ms,
-              g_st.sample_rate, g_st.channels, g_st.bits_per_sample / 8);
+              sample_rate, channels, bits_per_sample / 8);
 
     const int connect_cpu = cfg.cpu_audio >= 0 ? cfg.cpu_audio : 0;
     phase_event("connect_begin", "cpuMain=%d", connect_cpu);
@@ -1924,10 +1968,11 @@ static uint32_t open_sync_worker_blocking(scream_diretta::ScreamDirettaSync*& ou
     phase_event("play_end", "isPlay=%d", sync->isPlay() ? 1 : 0);
     dbg_event("play_return", "isPlay=%d", sync->isPlay() ? 1 : 0);
 
-    // Sync is fully open and ready. Activate the gate so getNewStream()
-    // may safely touch the externally-owned ring.
-    sync->activate();
-
+    // The Sync is fully open and ready, but we do NOT activate it here.
+    // Activation is deferred to finalize_sync_open_on_receiver() on the
+    // receive thread so that DSD transform flags negotiated above can be
+    // committed and any stale pre-negotiation PCM can be cleared from the
+    // queue before the SDK send thread starts pulling.
     out_sync = sync;
     return accepted_bits;
 }
@@ -1957,6 +2002,25 @@ static void finalize_sync_open_on_receiver(scream_diretta::ScreamDirettaSync* sy
         delete sync;
         g_st.sync = nullptr;
         return;
+    }
+
+    // Commit DSD transform flags negotiated by the async worker. The
+    // receive thread may have been writing PCM into the queue while the
+    // worker was opening the Sync; if the negotiated transform differs from
+    // the default (no transform), the queued bytes were produced with the
+    // wrong transform and must be discarded before playback starts.
+    if (g_st.is_dsd) {
+        const bool bit_reverse = g_st.async_open_dsd_needs_bit_reverse.load(std::memory_order_acquire);
+        const bool byte_swap   = g_st.async_open_dsd_needs_byte_swap.load(std::memory_order_acquire);
+        g_st.dsd_needs_bit_reverse.store(bit_reverse, std::memory_order_release);
+        g_st.dsd_needs_byte_swap.store(byte_swap, std::memory_order_release);
+        if (bit_reverse || byte_swap) {
+            const size_t discarded = g_st.queue.available();
+            g_st.queue.clear();
+            DLOG(1, "DSD transform negotiated (bit_reverse=%s byte_swap=%s); "
+                 "discarded %zu B of pre-negotiation PCM from queue",
+                 bit_reverse ? "yes" : "no", byte_swap ? "yes" : "no", discarded);
+        }
     }
 
     if (!g_st.phase_logged_open_grace_begin) {
@@ -2040,7 +2104,15 @@ static void finalize_sync_open_on_receiver(scream_diretta::ScreamDirettaSync* sy
               (unsigned long long)g_st.sync->ringFillMs(),
               g_st.sync->is_connect() ? 1 : 0,
               (unsigned long long)g_st.sync->getStreamCount());
+
+    // Activate the Sync only after format negotiation has been committed
+    // and any stale pre-negotiation PCM has been cleared. This guarantees
+    // the first SDK pull cycle sees transform-correct data.
+    sync->activate();
 }
+
+static void cleanup_sync_async(scream_diretta::ScreamDirettaSync* old,
+                               const char* reason_in);
 
 // Kick off a non-blocking Sync open. Returns false if a previous async open
 // is still in flight; callers should then continue ingesting into PcmRing.
@@ -2056,6 +2128,19 @@ static bool start_async_sync_open(const FormatConfigure& fc, const char* reason)
     if (g_st.async_open_thread.joinable()) {
         g_st.async_open_thread.join();
     }
+    // If a previous async open completed but was never installed (e.g. a
+    // reconnect raced with poll_async_sync_open()), clean it up now instead
+    // of leaking a live Sync + Target session.
+    if (g_st.async_open_pending_sync) {
+        DLOG(1, "start_async_sync_open: discarding completed but uninstalled Sync");
+        scream_diretta::ScreamDirettaSync* stale = g_st.async_open_pending_sync;
+        g_st.async_open_pending_sync = nullptr;
+        stale->deactivate();
+        stale->stop();
+        cleanup_sync_async(stale, "completed-async-open-discarded");
+        g_st.async_open_state.store(AOS_Idle, std::memory_order_release);
+    }
+
     const diretta_config_t& cfg = g_st.cfg;
     g_st.async_open_fc = fc;
     g_st.async_open_reason = reason ? reason : "";
@@ -2091,9 +2176,21 @@ static bool start_async_sync_open(const FormatConfigure& fc, const char* reason)
               g_st.bytes_per_frame,
               g_st.queue_ready ? g_st.queue.available() : 0,
               g_st.queue_ready ? g_st.queue.capacity() : 0);
+    // Snapshot the format scalars for the worker. The worker must not read
+    // mutable g_st fields while the receiver thread is running; all inputs
+    // are captured here before the thread is spawned.
+    const uint32_t snap_sample_rate = g_st.sample_rate;
+    const uint32_t snap_channels    = g_st.channels;
+    const uint32_t snap_bits        = g_st.bits_per_sample;
+    const bool     snap_is_dsd      = g_st.is_dsd;
+    const uint32_t snap_dsd_rate    = g_st.dsd_real_rate;
+    const uint32_t snap_dsd_mult    = g_st.dsd_multiplier;
+
     g_st.async_open_state.store(AOS_InProgress, std::memory_order_release);
     g_st.async_open_accepted_bits.store(0, std::memory_order_relaxed);
-    g_st.async_open_thread = std::thread([fc]() {
+    g_st.async_open_thread = std::thread([fc, snap_sample_rate, snap_channels,
+                                          snap_bits, snap_is_dsd, snap_dsd_rate,
+                                          snap_dsd_mult]() {
 #if defined(__linux__)
         // This worker is spawned from a context that may itself be running
         // SCHED_FIFO (e.g. the receiver thread at --rt-priority): a pthread
@@ -2109,7 +2206,10 @@ static bool start_async_sync_open(const FormatConfigure& fc, const char* reason)
         ::nice(-10);
 #endif
         scream_diretta::ScreamDirettaSync* sync_local = nullptr;
-        const uint32_t accepted_bits = open_sync_worker_blocking(sync_local, fc);
+        const uint32_t accepted_bits = open_sync_worker_blocking(
+            sync_local, fc,
+            snap_sample_rate, snap_channels, snap_bits,
+            snap_is_dsd, snap_dsd_rate, snap_dsd_mult);
         if (accepted_bits != 0) {
             g_st.async_open_pending_sync = sync_local;
             g_st.async_open_accepted_bits.store(accepted_bits, std::memory_order_release);
@@ -2217,9 +2317,19 @@ static void cleanup_sync_async(scream_diretta::ScreamDirettaSync* old,
         ::nice(-10);
 #endif
         const auto t0 = std::chrono::steady_clock::now();
-        bounded_disconnect(old, 0, reason.c_str());
-        old->close();
-        delete old;
+        try {
+            bounded_disconnect(old, 0, reason.c_str());
+            old->close();
+            delete old;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr,
+                "[diretta] cleanup thread exception (%s): %s\n",
+                reason.c_str(), e.what());
+        } catch (...) {
+            std::fprintf(stderr,
+                "[diretta] cleanup thread unknown exception (%s)\n",
+                reason.c_str());
+        }
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
         std::fprintf(stderr,
@@ -2267,6 +2377,7 @@ static bool validate_format(const receiver_format_t& rf, FormatConfigure& out_fc
                             uint32_t* out_rate, uint32_t* out_channels,
                             uint32_t* out_bits, uint32_t* out_bpf,
                             DerivedFormat* out_df) {
+    if (rf.sample_rate == 0) return false;
     if (rf.channels == 0) return false;
     // DSD sentinel (sample_size == 1) is valid; normal PCM needs sample_size > 0.
     if (rf.sample_size == 0) return false;
@@ -2288,23 +2399,12 @@ static bool reconfigure(const receiver_format_t& rf) {
              rf.sample_rate, rf.sample_size, rf.channels);
         return false;
     }
-    // Commit the derived format flags now that the format is accepted.
-    // reconfigure() is the sole committer so the validity probe in
-    // diretta_output_send() stays side-effect-free. DSD sink-order flags are
-    // (re)negotiated in open_sync_worker_blocking(), so reset to default here.
-    g_st.is_dsd = df.is_dsd;
-    g_st.dsd_multiplier = df.dsd_multiplier;
-    g_st.dsd_real_rate = df.dsd_real_rate;
-    g_st.pcm_needs_pack_24 = df.pcm_needs_pack_24;
-    g_st.dsd_needs_bit_reverse = false;
-    g_st.dsd_needs_byte_swap = false;
-
     // SOURCE bytes per frame from the Scream header (e.g. 8 for stereo S24_LE).
     const uint32_t src_bpf = bpf;
     // DESTINATION bytes per frame for the queue / SDK. Diretta SDK only has
     // packed S24_3LE, so S24_LE is converted on ingress and the queue stores
     // 3 bytes per sample regardless of wire_layout.
-    const uint32_t dst_bpf = (g_st.pcm_needs_pack_24) ? (3 * ch) : src_bpf;
+    const uint32_t dst_bpf = (df.pcm_needs_pack_24) ? (3 * ch) : src_bpf;
 
     // First open in this session has no previous stream to release.
     // For first-open we skip the format-change cooldown entirely (cooldown=0)
@@ -2318,15 +2418,15 @@ static bool reconfigure(const receiver_format_t& rf) {
     const int cooldown_ms = is_first_open ? 0 : effective_cooldown_ms();
     g_st.last_cooldown_ms = cooldown_ms;
 
-    if (g_st.is_dsd) {
+    if (df.is_dsd) {
         DLOG(1, "format change accepted: DSD (real_rate=%u Hz, mult=%u) container=%u Hz, %u-bit, %u ch (bpf=%u) "
              "[first_open=%d cooldown_ms=%d]",
-             g_st.dsd_real_rate, g_st.dsd_multiplier,
+             df.dsd_real_rate, df.dsd_multiplier,
              rate, bits, ch, dst_bpf, is_first_open ? 1 : 0, cooldown_ms);
     } else {
         DLOG(1, "format change accepted: %u Hz, %u-bit, %u ch (src_bpf=%u dst_bpf=%u pack24=%d) "
              "[first_open=%d cooldown_ms=%d]",
-             rate, bits, ch, src_bpf, dst_bpf, g_st.pcm_needs_pack_24 ? 1 : 0,
+             rate, bits, ch, src_bpf, dst_bpf, df.pcm_needs_pack_24 ? 1 : 0,
              is_first_open ? 1 : 0, cooldown_ms);
     }
     // Reset the global phase-trace anchor so every event after this point
@@ -2335,9 +2435,9 @@ static bool reconfigure(const receiver_format_t& rf) {
     dbg_event("format_change_accepted",
               "rate_hz=%u bits=%u channels=%u src_bpf=%u dst_bpf=%u pack24=%d first_open=%d cooldown_ms=%d "
               "open_gate_max_wait_ms=%d dsd=%d dsd_mult=%u dsd_real_rate=%u",
-              rate, bits, ch, src_bpf, dst_bpf, g_st.pcm_needs_pack_24 ? 1 : 0,
+              rate, bits, ch, src_bpf, dst_bpf, df.pcm_needs_pack_24 ? 1 : 0,
               is_first_open ? 1 : 0, cooldown_ms, OPEN_GATE_MAX_WAIT_MS,
-              g_st.is_dsd ? 1 : 0, g_st.dsd_multiplier, g_st.dsd_real_rate);
+              df.is_dsd ? 1 : 0, df.dsd_multiplier, df.dsd_real_rate);
 
     teardown_sync_for_runtime("format change");
 
@@ -2354,10 +2454,31 @@ static bool reconfigure(const receiver_format_t& rf) {
             DLOG(1, "format change: discarding stale async-opened Sync from previous format");
             scream_diretta::ScreamDirettaSync* stale = g_st.async_open_pending_sync;
             g_st.async_open_pending_sync = nullptr;
+            // The worker already activated this Sync (play() + activate())
+            // before returning. Stop the SDK send thread and close the gate
+            // so no in-flight getNewStream() is still inside the ring before
+            // configure_unified_queue() resizes it below. cleanup_sync_async()
+            // then finishes the asynchronous disconnect/close/delete.
+            stale->deactivate();
+            stale->stop();
             cleanup_sync_async(stale, "stale-async-open-on-format-change");
         }
         g_st.async_open_state.store(AOS_Idle, std::memory_order_release);
     }
+
+    // Commit the derived format flags only after any in-flight async open
+    // worker has joined. The worker reads these scalars during negotiation;
+    // committing them before the join was a data race (and could drive a
+    // stale worker to send a bogus setSinkConfigure when a format-change
+    // packet arrived mid-handshake).
+    g_st.is_dsd = df.is_dsd;
+    g_st.dsd_multiplier = df.dsd_multiplier;
+    g_st.dsd_real_rate = df.dsd_real_rate;
+    g_st.pcm_needs_pack_24 = df.pcm_needs_pack_24;
+    g_st.dsd_needs_bit_reverse.store(false, std::memory_order_release);
+    g_st.dsd_needs_byte_swap.store(false, std::memory_order_release);
+    g_st.async_open_dsd_needs_bit_reverse.store(false, std::memory_order_release);
+    g_st.async_open_dsd_needs_byte_swap.store(false, std::memory_order_release);
 
     g_st.sample_rate = rate;
     g_st.channels = ch;
@@ -2798,6 +2919,11 @@ static void maybe_log_prefill_progress() {
 extern "C" int diretta_apply_cpu_affinity(int core) {
     if (core < 0) return 0;
 #if defined(__linux__)
+    if (core >= CPU_SETSIZE) {
+        std::cerr << "[diretta] WARNING: CPU core index " << core
+                  << " exceeds CPU_SETSIZE (" << CPU_SETSIZE << ")" << std::endl;
+        return -1;
+    }
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(core, &cpuset);
@@ -2861,10 +2987,6 @@ extern "C" void diretta_config_init(diretta_config_t *cfg) {
     // the click by delaying the open itself. The CLI flag is still
     // parsed for back-compat but is not recommended.
     cfg->startup_mute_ms = 0;
-    // Queue cap during the startup window. 0 = no cap. Trades head
-    // of track for deterministic latency; only relevant if --startup-mute-ms
-    // is ALSO enabled or prefill is unusually deep.
-    cfg->startup_max_queue_ms = 0;
     // Post-play "real delay" silent window (ms). Default 0 = disabled
     // Unlike --startup-mute-ms, the
     // unified queue is NOT consumed during this window, so the head of the
@@ -3163,14 +3285,13 @@ extern "C" int diretta_output_init(const diretta_config_t *cfg) {
     }
     DLOG(1, "tuning: ring_buffer_ms=%d prefill_ms=%d startup_queue_ms=%d "
          "startup_mute_ms=%d (compatibility diagnostic, default 0) "
-         "startup_max_queue_ms=%d rebuffer_percent=%.0f%% "
+         "rebuffer_percent=%.0f%% "
          "underrun_rebuffer_ms=%d (0=use rebuffer_percent) "
          "startup_real_delay_ms=%d (0=disabled; silence after play without "
          "consuming queue)",
          g_st.cfg.ring_buffer_ms, g_st.cfg.prefill_ms,
          g_st.cfg.startup_queue_ms,
          g_st.cfg.startup_mute_ms,
-         g_st.cfg.startup_max_queue_ms,
          g_st.cfg.rebuffer_percent * 100.0f,
          g_st.cfg.underrun_rebuffer_ms,
          g_st.cfg.startup_real_delay_ms);
@@ -3328,6 +3449,13 @@ extern "C" int diretta_output_init(const diretta_config_t *cfg) {
          g_st.cfg.startup_analyze_ms, g_st.cfg.startup_fade_ms,
          g_st.cfg.compare_ingress_taps_ms);
 #endif
+
+    // Preallocate format-conversion scratch buffers once. 24-bit packing
+    // (S24_LE -> S24_3LE) and DSD bit-reverse/byte-swap are the hot paths
+    // for non-32-bit content; we avoid std::vector::resize() per packet by
+    // sizing them to a generous fixed upper bound here.
+    g_st.dsd_transform_buffer.assign(SCREAM_MAX_PACKET_BYTES, 0);
+    g_st.pcm_pack_buffer.assign(SCREAM_MAX_PACKET_BYTES, 0);
 
     g_st.sdk_open = true;
     g_st.initialized = true;
@@ -4060,40 +4188,6 @@ ingress_only:
         }
     }
 
-    // Optional queue cap during the startup mute / prefill window.
-    // While the Sync hasn't finished its silent warmup AND the prefill
-    // gate hasn't opened yet, drop oldest queued bytes down to the
-    // configured cap. Default 0 = no cap. This trades the very head of
-    // the track for a deterministic startup latency on machines where
-    // the cooldown leaves ~1.2s queued.
-    if (g_st.queue_ready && g_st.cfg.startup_max_queue_ms > 0 &&
-        g_st.sample_rate > 0 && g_st.bytes_per_frame > 0) {
-        const bool mute_pending   = (!g_st.sync || !g_st.sync->muteDone());
-        const bool prefill_pending = (!g_st.sync || !g_st.sync->prefillDone());
-        if (mute_pending || prefill_pending) {
-            const uint64_t bps = static_cast<uint64_t>(g_st.sample_rate) *
-                                 static_cast<uint64_t>(g_st.bytes_per_frame);
-            size_t cap_bytes = static_cast<size_t>(
-                (bps * static_cast<uint64_t>(g_st.cfg.startup_max_queue_ms)) / 1000);
-            cap_bytes = (cap_bytes / g_st.bytes_per_frame) * g_st.bytes_per_frame;
-            size_t avail = g_st.queue.available();
-            if (cap_bytes > 0 && avail > cap_bytes) {
-                size_t excess = avail - cap_bytes;
-                excess = (excess / g_st.bytes_per_frame) * g_st.bytes_per_frame;
-                if (excess > 0) {
-                    size_t dropped = g_st.queue.discardOldest(excess);
-                    if (dropped > 0 && verbosity >= 2) {
-                        DLOG(2, "startup queue cap: trimmed %zu B (~%llu ms) "
-                             "oldest to keep fill <= %d ms",
-                             dropped,
-                             (unsigned long long)((static_cast<uint64_t>(dropped) * 1000ULL) / bps),
-                             g_st.cfg.startup_max_queue_ms);
-                    }
-                }
-            }
-        }
-    }
-
     // --- Single unified queue ingress path ---
     // Always write into g_st.queue when armed. The producer never needs
     // to know whether a Sync is open or not — the queue is the only
@@ -4226,6 +4320,26 @@ extern "C" void diretta_output_shutdown(void) {
     }
     teardown_sync_for_shutdown();
     cleanup_finder();
+
+    // Detached cleanup threads from format-change / idle-release teardowns
+    // may still be inside bounded_disconnect() / close() / delete(). Wait for
+    // them to finish before returning so the process does not exit underneath
+    // an active SDK thread, and so the Target gets the full disconnect notice.
+    const int cleanup_wait_deadline_ms = 2000;
+    const auto cleanup_wait_start = std::chrono::steady_clock::now();
+    while (g_inflight_cleanups.load(std::memory_order_acquire) > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - cleanup_wait_start).count();
+        if (elapsed > cleanup_wait_deadline_ms) {
+            std::fprintf(stderr,
+                "[diretta] WARNING: shutdown timed out waiting for %d cleanup thread(s); "
+                "proceeding with exit\n",
+                g_inflight_cleanups.load(std::memory_order_acquire));
+            break;
+        }
+    }
+
     // Close open PCM dump files and patch WAV header sizes so captures remain
     // playable even if shutdown was abrupt.
     // teardown_sync_for_shutdown above has already stopped the SDK send

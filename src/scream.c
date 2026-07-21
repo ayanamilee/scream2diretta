@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include "config.h"
 
 #include <stdio.h>
@@ -17,34 +19,17 @@
 
 #include "scream.h"
 #include "network.h"
-#include "shmem.h"
 
 #include "raw.h"
 #include "receiver_tap.h"
 #include <errno.h>
 
+#if defined(__linux__)
+#include <sched.h>
+#endif
+
 #ifndef SCREAM2DIRETTA_VERSION
-#define SCREAM2DIRETTA_VERSION "0.3"
-#endif
-
-#if PULSEAUDIO_ENABLE
-#include "pulseaudio.h"
-#endif
-
-#if ALSA_ENABLE
-#include "alsa.h"
-#endif
-
-#if PCAP_ENABLE
-#include "pcap_input.h"
-#endif
-
-#if JACK_ENABLE
-#include "jack.h"
-#endif
-
-#if SNDIO_ENABLE
-#include "sndio.h"
+#define SCREAM2DIRETTA_VERSION "0.7"
 #endif
 
 #if DIRETTA_ENABLE
@@ -68,9 +53,9 @@ static void install_term_handlers(void) {
   sigaddset(&sa.sa_mask, SIGINT);
   sigaddset(&sa.sa_mask, SIGTERM);
   // Deliberately do NOT set SA_RESTART: blocking syscalls (recvfrom, select,
-  // usleep, pcap_dispatch) must return EINTR so the receivers can observe
-  // the shutdown flag and unwind. Each receiver checks g_shutdown_pending
-  // both before blocking and after EINTR.
+  // usleep) must return EINTR so the receivers can observe the shutdown flag
+  // and unwind. Each receiver checks g_shutdown_pending both before blocking
+  // and after EINTR.
   sigaction(SIGINT,  &sa, NULL);
   sigaction(SIGTERM, &sa, NULL);
 }
@@ -100,8 +85,6 @@ static void show_usage(const char *arg0)
   fprintf(stderr, "  -p <port>                    Use <port> instead of default port 4010.\n");
   fprintf(stderr, "  -i <iface>                   Use local interface <iface> (IP or name).\n");
   fprintf(stderr, "  -g <group>                   Multicast group address (multicast mode only).\n");
-  fprintf(stderr, "  -m <ivshmem device path>     Use shared memory device.\n");
-  fprintf(stderr, "  -P                           Use libpcap to sniff the packets.\n");
   fprintf(stderr, "  -L                           Legacy mode: parse original 5-byte Scream header\n");
   fprintf(stderr, "                               (for original screamalsa driver / ap2renderer).\n");
   fprintf(stderr, "  --udp-rcvbuf-bytes <bytes>   Kernel SO_RCVBUF size on the UDP socket\n");
@@ -200,7 +183,7 @@ static void show_usage(const char *arg0)
 
 static in_addr_t get_interface(const char *name)
 {
-  int sockfd;
+  int sockfd = -1;
   struct ifreq ifr;
   in_addr_t addr = inet_addr(name);
   struct if_nameindex *ni;
@@ -219,6 +202,10 @@ static in_addr_t get_interface(const char *name)
   strcpy(ifr.ifr_name, name);
 
   sockfd = socket(AF_INET,SOCK_DGRAM,0);
+  if (sockfd < 0) {
+    fprintf(stderr, "Failed to create socket to resolve interface: %s\n\n", name);
+    goto error_exit;
+  }
   if (ioctl(sockfd, SIOCGIFADDR, &ifr) != 0) {
     fprintf(stderr, "Invalid interface: %s\n\n", name);
     goto error_exit;
@@ -228,12 +215,18 @@ static in_addr_t get_interface(const char *name)
 
 error_exit:
   ni = if_nameindex();
-  fprintf(stderr, "Available interfaces:\n");
-  for (i = 0; ni[i].if_name != NULL; i++) {
-    strcpy(ifr.ifr_name, ni[i].if_name);
-    if (ioctl(sockfd, SIOCGIFADDR, &ifr) == 0) {
-      fprintf(stderr, "  %-10s (%s)\n", ni[i].if_name, inet_ntoa(((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr));
+  if (ni) {
+    fprintf(stderr, "Available interfaces:\n");
+    for (i = 0; ni[i].if_name != NULL; i++) {
+      strcpy(ifr.ifr_name, ni[i].if_name);
+      if (sockfd >= 0 && ioctl(sockfd, SIOCGIFADDR, &ifr) == 0) {
+        fprintf(stderr, "  %-10s (%s)\n", ni[i].if_name, inet_ntoa(((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr));
+      }
     }
+    if_freenameindex(ni);
+  }
+  if (sockfd >= 0) {
+    close(sockfd);
   }
   exit(1);
 }
@@ -251,8 +244,7 @@ static int parse_transfer_mode(const char *s, diretta_transfer_mode_t *out) {
 #endif
 
 enum {
-  OPT_LATENCY = 1000,
-  OPT_LIST_TARGETS,
+  OPT_LIST_TARGETS = 1000,
   OPT_THREAD_MODE,
   OPT_CYCLE_TIME,
   OPT_CYCLE_MIN_TIME,
@@ -265,7 +257,6 @@ enum {
   OPT_REBUFFER_PERCENT,
   OPT_STARTUP_QUEUE_MS,
   OPT_STARTUP_MUTE_MS,
-  OPT_STARTUP_MAX_QUEUE_MS,
   OPT_STATS_INTERVAL,
   OPT_STATS,
   OPT_DIRETTA_DEBUG,
@@ -312,7 +303,6 @@ static const struct option long_options[] = {
   { "quiet",                no_argument,       0, 'q' },
   { "help",                 no_argument,       0, 'h' },
   { "version",              no_argument,       0, OPT_VERSION },
-  { "latency",              required_argument, 0, OPT_LATENCY },
   { "thread-mode",          required_argument, 0, OPT_THREAD_MODE },
   { "cycle-time",           required_argument, 0, OPT_CYCLE_TIME },
   { "cycle-min-time",       required_argument, 0, OPT_CYCLE_MIN_TIME },
@@ -325,7 +315,6 @@ static const struct option long_options[] = {
   { "rebuffer-percent",     required_argument, 0, OPT_REBUFFER_PERCENT },
   { "startup-queue-ms",     required_argument, 0, OPT_STARTUP_QUEUE_MS },
   { "startup-mute-ms",      required_argument, 0, OPT_STARTUP_MUTE_MS },
-  { "startup-max-queue-ms", required_argument, 0, OPT_STARTUP_MAX_QUEUE_MS },
   { "stats-interval",       required_argument, 0, OPT_STATS_INTERVAL },
   { "stats",                no_argument,       0, OPT_STATS },
   { "diretta-debug",        no_argument,       0, OPT_DIRETTA_DEBUG },
@@ -377,8 +366,6 @@ int main(int argc, char*argv[]) {
   }
   argc = j;
 
-  int res;
-
   void (*receiver_rcv_fn)(receiver_data_t* receiver_data);
   receiver_data_t receiver_data;
 
@@ -397,19 +384,10 @@ int main(int argc, char*argv[]) {
   int output_mode_user_set = 0;
 
   char *multicast_group      = NULL;
-  char *ivshmem_device       = NULL;
   char *output               = NULL;
   const char* interface_name = NULL;
-  char *alsa_device          = "default";
-  char *sndio_device         = NULL;
-  char *pa_sink              = NULL;
-  char *pa_stream_name       = "Audio";
-  char *jack_client_name     = "scream";
-  int target_latency_ms      = 50;
-  int max_latency_ms         = 100;
   in_addr_t interface        = INADDR_ANY;
   uint16_t port              = DEFAULT_PORT;
-  int jack_connect           = 1;
   int quiet                  = 0;
   int legacy_mode            = 0;
   int do_list_targets        = 0;
@@ -456,7 +434,7 @@ int main(int argc, char*argv[]) {
   int longindex = 0;
 
   while ((opt = getopt_long(argc, argv,
-                            "i:g:p:m:x:o:d:s:n:t:l:PuL vqhc",
+                            "i:g:p:x:o:t:uLvqh",
                             long_options, &longindex)) != -1) {
     switch (opt) {
     case 'i':
@@ -472,46 +450,22 @@ int main(int argc, char*argv[]) {
     case 'g':
       multicast_group = strdup(optarg);
       break;
-    case 'P':
-      receiver_mode = Pcap;
-      break;
     case 'L':
       legacy_mode = 1;
       break;
-    case 'm':
-      receiver_mode = SharedMem;
-      ivshmem_device = strdup(optarg);
-      break;
     case 'o':
       output = strdup(optarg);
-      /* 'raw' and 'diretta' are the two documented backends. The other
-       * compatibility backend names continue to parse and dispatch when compiled in,
-       * but they are no longer shown in --help. The compatibility 'stdout' spelling
-       * is also accepted as a hidden alias for 'raw' so old shell scripts
-       * keep working. */
-      if (strcmp(output,"pulse") == 0) output_mode = Pulseaudio;
-      else if (strcmp(output,"alsa") == 0) output_mode = Alsa;
-      else if (strcmp(output,"jack") == 0) output_mode = Jack;
-      else if (strcmp(output,"sndio") == 0) output_mode = Sndio;
-      else if (strcmp(output,"raw") == 0) output_mode = Raw;
-      else if (strcmp(output,"stdout") == 0) output_mode = Raw;
+      /* Only 'raw' and 'diretta' are supported. The legacy backends
+       * (pulse/alsa/jack/sndio) have been removed. The 'stdout' spelling
+       * is kept as a hidden alias for 'raw' so old shell scripts keep
+       * working. */
+      if (strcmp(output,"raw") == 0 || strcmp(output,"stdout") == 0) output_mode = Raw;
       else if (strcmp(output,"diretta") == 0) output_mode = Diretta;
       else {
-        fprintf(stderr, "invalid output: %s\n", output);
+        fprintf(stderr, "output backend '%s' has been removed; only 'raw' and 'diretta' are supported\n", output);
         return 1;
       }
       output_mode_user_set = 1;
-      break;
-    case 'd':
-      alsa_device = strdup(optarg);
-      sndio_device = alsa_device;
-      break;
-    case 's':
-      pa_sink = strdup(optarg);
-      break;
-    case 'n':
-      pa_stream_name = strdup(optarg);
-      jack_client_name = pa_stream_name;
       break;
     case 't':
 #if DIRETTA_ENABLE
@@ -525,13 +479,6 @@ int main(int argc, char*argv[]) {
       return 1;
 #endif
       break;
-    case 'l':
-      max_latency_ms = atoi(optarg);
-      if (max_latency_ms < 0) show_usage(argv[0]);
-      break;
-    case 'c':
-      jack_connect = 0;
-      break;
     case 'v':
       verbosity += 1;
       break;
@@ -540,10 +487,6 @@ int main(int argc, char*argv[]) {
       break;
     case 'h':
       show_usage(argv[0]);
-      break;
-    case OPT_LATENCY:
-      target_latency_ms = atoi(optarg);
-      if (target_latency_ms < 0) show_usage(argv[0]);
       break;
     case OPT_LIST_TARGETS:
       do_list_targets = 1;
@@ -675,6 +618,12 @@ int main(int argc, char*argv[]) {
         fprintf(stderr, "--cpu-scream must be >= 0\n");
         return 1;
       }
+#if defined(__linux__)
+      if (v >= CPU_SETSIZE) {
+        fprintf(stderr, "--cpu-scream must be < %d\n", CPU_SETSIZE);
+        return 1;
+      }
+#endif
       dcfg.cpu_scream = v;
       break;
     }
@@ -684,6 +633,12 @@ int main(int argc, char*argv[]) {
         fprintf(stderr, "--cpu-audio must be >= 0\n");
         return 1;
       }
+#if defined(__linux__)
+      if (v >= CPU_SETSIZE) {
+        fprintf(stderr, "--cpu-audio must be < %d\n", CPU_SETSIZE);
+        return 1;
+      }
+#endif
       dcfg.cpu_audio = v;
       break;
     }
@@ -693,6 +648,12 @@ int main(int argc, char*argv[]) {
         fprintf(stderr, "--cpu-other must be >= 0\n");
         return 1;
       }
+#if defined(__linux__)
+      if (v >= CPU_SETSIZE) {
+        fprintf(stderr, "--cpu-other must be < %d\n", CPU_SETSIZE);
+        return 1;
+      }
+#endif
       dcfg.cpu_other = v;
       break;
     }
@@ -733,15 +694,6 @@ int main(int argc, char*argv[]) {
         return 1;
       }
       dcfg.startup_mute_ms = v;
-      break;
-    }
-    case OPT_STARTUP_MAX_QUEUE_MS: {
-      int v = atoi(optarg);
-      if (v < 0 || v > 5000) {
-        fprintf(stderr, "--startup-max-queue-ms must be 0..5000 (0=off)\n");
-        return 1;
-      }
-      dcfg.startup_max_queue_ms = v;
       break;
     }
     case OPT_STATS_INTERVAL: {
@@ -919,7 +871,6 @@ int main(int argc, char*argv[]) {
     case OPT_REBUFFER_PERCENT:
     case OPT_STARTUP_QUEUE_MS:
     case OPT_STARTUP_MUTE_MS:
-    case OPT_STARTUP_MAX_QUEUE_MS:
     case OPT_STATS_INTERVAL:
     case OPT_STATS:
     case OPT_DIRETTA_DEBUG:
@@ -1055,7 +1006,7 @@ int main(int argc, char*argv[]) {
   #endif
   (void)output_mode_user_set;
 
-  if (interface_name && receiver_mode != Pcap) {
+  if (interface_name) {
       interface = get_interface(interface_name);
   }
 
@@ -1070,54 +1021,6 @@ int main(int argc, char*argv[]) {
 
   // initialize output
   switch (output_mode) {
-    case Pulseaudio:
-#if PULSEAUDIO_ENABLE
-      if (verbosity) fprintf(stderr, "Using Pulseaudio output\n");
-      if (pulse_output_init(target_latency_ms, max_latency_ms, pa_sink, pa_stream_name) != 0) {
-        return 1;
-      }
-      output_send_fn = pulse_output_send;
-#else
-      fprintf(stderr, "%s compiled without Pulseaudio support. Aborting\n", argv[0]);
-      return 1;
-#endif
-      break;
-    case Alsa:
-#if ALSA_ENABLE
-      if (verbosity) fprintf(stderr, "Using ALSA output\n");
-      if (alsa_output_init(target_latency_ms, alsa_device) != 0) {
-        return 1;
-      }
-      output_send_fn = alsa_output_send;
-#else
-      fprintf(stderr, "%s compiled without ALSA support. Aborting\n", argv[0]);
-      return 1;
-#endif
-      break;
-    case Jack:
-#if JACK_ENABLE
-      if (verbosity) fprintf(stderr, "Using JACK output\n");
-      if (jack_output_init(target_latency_ms, jack_client_name, jack_connect) != 0) {
-        return 1;
-      }
-      output_send_fn = jack_output_send;
-#else
-      fprintf(stderr, "%s compiled without JACK support. Aborting\n", argv[0]);
-      return 1;
-#endif
-      break;
-    case Sndio:
-#if SNDIO_ENABLE
-      if (verbosity) fprintf(stderr, "Using sndio output\n");
-      if (sndio_output_init(max_latency_ms, sndio_device) != 0) {
-        return 1;
-      }
-      output_send_fn = sndio_output_send;
-#else
-      fprintf(stderr, "%s compiled without sndio support. Aborting\n", argv[0]);
-      return 1;
-#endif
-      break;
     case Raw:
       if (verbosity) fprintf(stderr, "Using raw output\n");
       if (raw_output_init() != 0) {
@@ -1277,38 +1180,14 @@ int main(int argc, char*argv[]) {
   }
 
   // initialize receiver
-  switch (receiver_mode) {
-    case SharedMem:
-      if (verbosity) fprintf(stderr, "Starting IVSHMEM receiver\n");
-      init_shmem(ivshmem_device, target_latency_ms);
-      receiver_rcv_fn = rcv_shmem;
-      break;
-    case Pcap:
-#if PCAP_ENABLE
-      res = init_pcap(interface_name, port, multicast_group);
-      if (res != 0) return res;
-      res = run_pcap(output_send_fn);
-#if DIRETTA_ENABLE
-      if (output_mode == Diretta) diretta_output_shutdown();
-#endif
-      return res;
-#else
-      fprintf(stderr, "%s compiled without libpcap support. Aborting", argv[0]);
-      return 1;
-#endif
-    case Unicast:
-    case Multicast:
-    default:
-      if (verbosity) fprintf(stderr, "Starting %s receiver\n", receiver_mode == Unicast ? "unicast" : "multicast");
-      if (init_network(receiver_mode, interface, port, multicast_group,
-                         udp_rcvbuf_bytes, allowed_source_ip,
-                         udp_busy_poll_us, enable_nic_timestamp,
-                         legacy_mode) != 0) {
-        return 1;
-      }
-      receiver_rcv_fn = rcv_network;
-      break;
+  if (verbosity) fprintf(stderr, "Starting %s receiver\n", receiver_mode == Unicast ? "unicast" : "multicast");
+  if (init_network(receiver_mode, interface, port, multicast_group,
+                     udp_rcvbuf_bytes, allowed_source_ip,
+                     udp_busy_poll_us, enable_nic_timestamp,
+                     legacy_mode) != 0) {
+    return 1;
   }
+  receiver_rcv_fn = rcv_network;
 
 
   int rc = 0;

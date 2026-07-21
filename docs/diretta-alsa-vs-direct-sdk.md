@@ -209,30 +209,31 @@ void beginReconfigure() {
 - `users_` = 读者引用计数
 - `acq_rel` 保证 ring 操作 happen-before 计数归零
 
-### s2d：简化 SPSC
+### s2d：简化 SPSC + 消费者侧 reconfig guard
 
 s2d 的 `PcmRing` 是**严格单生产者单消费者**：
 
 - Producer：唯一的 Scream UDP 接收线程
 - Consumer：唯一的 Diretta SDK send 线程
-- 重建策略：先 stop/join consumer → `resize()` ring → restart consumer
+- `PcmRing` 本身是纯 SPSC：只有 `m_writePos` / `m_readPos` 两个原子位置，无读者计数器。
+- 但在 `ScreamDirettaSync::getNewStream()` 进入 ring 前加了 `RingUserGuard`（两阶段检查 + 读者计数），`deactivate()` 先置 `m_active=false` 再自旋等待计数归零。这样 reconfig/resize 时无需 stop/join consumer，receiver 线程可以持续 push 数据。
 
 ```cpp
 alignas(64) std::atomic<size_t> m_writePos{0};   // 仅生产者写
 alignas(64) std::atomic<size_t> m_readPos{0};    // 仅消费者写
 ```
 
-没有 `users_` 计数器，没有 `reconfiguring` 标志。因为**重建前消费者已不存在**，不存在「第三方线程在热路径活跃时修改 ring 元数据」的场景。
+没有 `reconfiguring` 标志或 writerside guard，因为**生产者只有一个且永远不会在 reconfig 时停止**。消费者侧用 `RingUserGuard` + `deactivate()` 关闭 in-flight cycle 窗口。
 
 ### 对比
 
 | 维度 | DRUP (RingAccessGuard) | s2d (PcmRing) |
 |------|------------------------|---------------|
 | **并发模型** | 多生产者可能并发 + 控制线程重配置 | 严格 SPSC |
-| **重配置安全** | 运行时无锁协议 | 静态生命周期（stop → join → resize） |
-| **额外原子开销** | 每次热路径 2 次（add/sub） | 零额外开销 |
+| **重配置安全** | 运行时无锁协议（producer + consumer 两侧 guard） | 消费者侧 `RingUserGuard` + `deactivate()`；producer 永不停 |
+| **额外原子开销** | 每次热路径 2 次（add/sub） | consumer 侧 2 次（add/sub），producer 无额外开销 |
 | **通用性** | 高，适配任意多线程音频源 | 低，绑定 Scream 单线程模型 |
-| **代码复杂度** | 需 guard + 双检 + yield 等待 | 只需 read/write pos + mask |
+| **代码复杂度** | 需 guard + 双检 + yield 等待 | producer 只需 read/write pos + mask；consumer 加一个 guard |
 
 **结论**：DRUP 的 guard 是「多线程混乱世界里的防弹衣」；s2d 的 SPSC 是「把问题消灭在架构设计层面，不需要防弹衣」。两者都是各自场景下的正确选择。
 

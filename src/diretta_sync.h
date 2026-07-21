@@ -204,10 +204,13 @@ private:
     std::atomic<int> m_ringUsers{0};
 
     // Real-time priority state. Set by the owner (DirettaState) before the
-    // SDK send thread starts pulling. Applied exactly once inside
-    // getNewStream() on the first call so it runs on the SDK worker thread.
+    // SDK send thread starts pulling. Applied inside getNewStream() on the
+    // first few calls so it runs on the SDK worker thread. Retried up to
+    // RT_PRIORITY_MAX_ATTEMPTS on failure instead of giving up permanently.
     std::atomic<int>  m_rtPriority{-1};
     std::atomic<bool> m_rtPriorityApplied{false};
+    std::atomic<int>  m_rtPriorityAttempts{0};
+    static constexpr int RT_PRIORITY_MAX_ATTEMPTS = 5;
 
     //  egress PCM dumper. Owned by DirettaState in diretta.cpp; the
     // Sync just calls pcm_dumper_write() from getNewStream() when the cycle
@@ -233,6 +236,15 @@ private:
     std::atomic<uint8_t>  m_silenceByte{0};
     std::atomic<uint32_t> m_bytesPerSecond{0};
     std::atomic<uint32_t> m_bytesPerFrame{0};
+
+    // Fractional-frame drift compensation. getCycleSize() is not guaranteed
+    // to be a whole multiple of bytesPerFrame. We truncate to an integer
+    // number of frames to avoid L/R channel drift, then accumulate the
+    // truncated bytes here and add one extra frame whenever the accumulator
+    // reaches a full frame. This keeps the long-term average bytes-per-cycle
+    // equal to the SDK's intended value without changing the cycle timing.
+    std::atomic<size_t> m_cycleRemainder{0};            // bytes truncated per cycle
+    std::atomic<size_t> m_cycleRemainderAccumulator{0}; // accumulated truncation
 
     std::atomic<bool> m_prefillDone{false};
     std::atomic<bool> m_rebuffering{false};
@@ -269,7 +281,8 @@ private:
     std::atomic<bool>   m_muteDone{true};   // true == no mute requested
 
     // Persistent buffer the SDK reads from; resized on configureFormat to
-    // match getCycleSize() so getNewStream() never allocates.
+    // match getCycleSize() (plus one extra frame for drift compensation)
+    // so getNewStream() never allocates.
     std::vector<uint8_t> m_streamData;
 
     // Stats.

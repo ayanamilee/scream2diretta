@@ -77,13 +77,28 @@ void ScreamDirettaSync::deactivate() {
     // first m_active check has exited its RingUserGuard. After this
     // returns the owner (DirettaState) is guaranteed no SDK pull is
     // inside m_ring access and may safely resize / free the
-    // externally-owned ring buffer. Cycles are ~hundreds of microseconds
-    // long so the yield loop is bounded in practice; we deliberately do
-    // not impose a deadline because a forced detach here would re-
-    // introduce the use-after-free we are trying to eliminate.
+    // externally-owned ring buffer.
+    //
+    // The caller may run under SCHED_FIFO (e.g. the receiver thread with
+    // --rt-priority). A pure yield loop can starve the non-RT SDK worker
+    // that holds the guard, especially when both are pinned to the same
+    // core. We therefore busy-yield briefly and then sleep, giving the
+    // holder a chance to run and exit even under priority inversion.
+    //
+    // Also clear the steady-state fast-path flag: taking the Sync out of
+    // normal play means any future getNewStream cycles (if the Sync is
+    // later re-activated) must re-run the full gate cascade instead of
+    // assuming the previous steady-state invariants still hold.
+    exitSteadyState();
     m_active.store(false, std::memory_order_release);
+    int spins = 0;
     while (m_ringUsers.load(std::memory_order_acquire) > 0) {
-        std::this_thread::yield();
+        if (spins < 1000) {
+            std::this_thread::yield();
+            ++spins;
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
     }
 }
 
@@ -194,15 +209,16 @@ void ScreamDirettaSync::configureFormat(uint32_t sampleRate,
     // for each call. getCycleSize() is valid as soon as setSinkConfigure()
     // and a transfer-mode (configTransferAuto/etc.) have been applied -- the
     // caller orders configureFormat() after those steps.
-    size_t cycle = getCycleSize();
+    size_t raw_cycle = getCycleSize();
     // Defensive frame alignment: SDK normally returns frame-aligned cycle sizes
     // (cycle_us * bytesPerSec / 1e6 is naturally aligned for integer cycle_us
     // and frame-aligned formats), but align here anyway for consistency with
     // every other threshold above and to harden against any future SDK change.
     // The producer (diretta_output_send) only ever pushes whole frames, so the
     // consumer must also pop in whole-frame multiples to avoid L/R drift.
-    if (bytesPerFrame > 0 && cycle > 0) {
-        cycle = (cycle / bytesPerFrame) * bytesPerFrame;
+    size_t cycle = raw_cycle;
+    if (bytesPerFrame > 0 && raw_cycle > 0) {
+        cycle = (raw_cycle / bytesPerFrame) * bytesPerFrame;
     }
     if (cycle == 0) {
         // Fallback to ~1ms worth of audio rounded to a frame.
@@ -211,9 +227,27 @@ void ScreamDirettaSync::configureFormat(uint32_t sampleRate,
             cycle = (cycle / bytesPerFrame) * bytesPerFrame;
         }
         if (cycle == 0) cycle = bytesPerFrame;
+        raw_cycle = cycle;   // fallback is already frame-aligned
     }
+
+    // Fractional-frame drift compensation. getCycleSize() may be slightly
+    // larger than an integer number of frames (e.g. 44.1k over standard MTU).
+    // We truncate the cycle to whole frames above, but remember how many
+    // bytes were truncated and add an extra frame every time the accumulated
+    // truncation reaches a full frame. This keeps the long-term average
+    // bytes-per-cycle equal to the SDK's intended value.
+    size_t remainder = 0;
+    if (bytesPerFrame > 0 && raw_cycle > cycle) {
+        remainder = raw_cycle - cycle;
+    }
+    m_cycleRemainder.store(remainder, std::memory_order_release);
+    m_cycleRemainderAccumulator.store(0, std::memory_order_release);
     m_streamBytes.store(cycle, std::memory_order_release);
-    m_streamData.assign(cycle, silence);
+
+    // Preallocate one extra frame so the occasional +1-frame compensation
+    // cycle fits without a heap allocation on the audio hot path.
+    const size_t streamDataSize = cycle + (bytesPerFrame > 0 ? bytesPerFrame : 0);
+    m_streamData.assign(streamDataSize, silence);
 
     resetGate();
 }
@@ -238,7 +272,27 @@ void ScreamDirettaSync::resetGate() {
 }
 
 bool ScreamDirettaSync::getNewStream(diretta_stream& s) {
-    const size_t want = m_streamBytes.load(std::memory_order_acquire);
+    const size_t baseWant = m_streamBytes.load(std::memory_order_acquire);
+
+    // Fractional-frame drift compensation. getCycleSize() is not necessarily
+    // a whole multiple of bytesPerFrame; we truncated it to whole frames in
+    // configureFormat() to avoid L/R drift. Accumulate the truncated bytes and
+    // add one extra frame whenever the accumulator reaches a full frame. This
+    // keeps the long-term average bytes-per-cycle equal to the SDK's intended
+    // value without changing cycle timing. The extra frame fits in m_streamData
+    // because configureFormat() preallocated one additional frame.
+    size_t want = baseWant;
+    const size_t bpf = m_bytesPerFrame.load(std::memory_order_relaxed);
+    const size_t remainder = m_cycleRemainder.load(std::memory_order_relaxed);
+    if (bpf > 0 && remainder > 0) {
+        size_t acc = m_cycleRemainderAccumulator.load(std::memory_order_relaxed);
+        acc += remainder;
+        if (acc >= bpf) {
+            acc -= bpf;
+            want += bpf;   // consume one extra frame this cycle
+        }
+        m_cycleRemainderAccumulator.store(acc, std::memory_order_relaxed);
+    }
 
     // Gate 0: if the Sync is being torn down, emit silence without touching
     // the externally-owned ring (which may be resizing or destroyed).
@@ -267,6 +321,9 @@ bool ScreamDirettaSync::getNewStream(diretta_stream& s) {
 
     // Apply SCHED_FIFO once on the first real call, running on the SDK
     // worker thread so the priority affects the actual audio pull path.
+    // Retry a few times on failure instead of giving up permanently,
+    // because the failure is often transient (e.g. EPERM before caps are
+    // applied, or the thread inheriting the wrong policy at creation).
     if (__builtin_expect(!m_rtPriorityApplied.load(std::memory_order_acquire), 0)) {
         const int prio = m_rtPriority.load(std::memory_order_relaxed);
         if (prio >= 1) {
@@ -276,14 +333,23 @@ bool ScreamDirettaSync::getNewStream(diretta_stream& s) {
             if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) == 0) {
                 std::cout << "[diretta] SDK worker set to SCHED_FIFO priority "
                           << prio << std::endl;
+                m_rtPriorityApplied.store(true, std::memory_order_release);
             } else {
+                const int attempts = m_rtPriorityAttempts.fetch_add(1, std::memory_order_relaxed) + 1;
                 std::cerr << "[diretta] WARNING: Failed to set SDK worker "
                           << "SCHED_FIFO priority " << prio
-                          << " (errno=" << errno << ")" << std::endl;
+                          << " (errno=" << errno << ") attempt " << attempts << "/"
+                          << RT_PRIORITY_MAX_ATTEMPTS << std::endl;
+                if (attempts >= RT_PRIORITY_MAX_ATTEMPTS) {
+                    m_rtPriorityApplied.store(true, std::memory_order_release);
+                }
             }
+#else
+            m_rtPriorityApplied.store(true, std::memory_order_release);
 #endif
+        } else {
+            m_rtPriorityApplied.store(true, std::memory_order_release);
         }
-        m_rtPriorityApplied.store(true, std::memory_order_release);
     }
 
     if (__builtin_expect(want == 0 || !m_ring, 0)) {
@@ -292,9 +358,11 @@ bool ScreamDirettaSync::getNewStream(diretta_stream& s) {
         s.Size = 0;
         return true;
     }
-    if (__builtin_expect(m_streamData.size() != want, 0)) {
-        // configureFormat preallocates this; in steady state this branch is
-        // never taken. We still resize defensively for the very first call.
+    if (__builtin_expect(m_streamData.size() < want, 0)) {
+        // configureFormat preallocates at least one extra frame so the
+        // fractional-frame drift compensation cycle fits; in steady state
+        // this branch is never taken. Only grow, never shrink, so we do not
+        // reallocate on cycles that use the base cycle size.
         m_streamData.assign(want, m_silenceByte.load(std::memory_order_acquire));
     }
     s.Data.P = m_streamData.data();

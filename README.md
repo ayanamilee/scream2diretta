@@ -1,6 +1,6 @@
 # scream2diretta
 
-**v0.6** · A native **Scream UDP → Diretta SDK** bridge for Linux (aarch64, x86-64).
+**v0.7** · A native **Scream UDP → Diretta SDK** bridge for Linux (aarch64, x86-64).
 
 Receives a continuous uncompressed PCM stream from a remote machine running ASIOScream / ScreamDriver / scream-alsa over UDP, and forwards it directly to a Diretta-capable DAC via the Diretta Host SDK — **without ALSA, FFmpeg, UPnP, or any intermediate software layer**.
 
@@ -153,20 +153,19 @@ mkdir build && cd build
 cmake -DDIRETTA_ENABLE=ON -DDIRETTA_SDK_ROOT=../DirettaHostSDK_149 ..
 make -j$(nproc)
 
-# Full-featured build (explicit arch, static, no SDK logging)
+# Full-featured build (explicit arch, no SDK logging)
 cmake -DDIRETTA_ENABLE=ON \
       -DDIRETTA_SDK_ROOT=../DirettaHostSDK_149 \
       -DDIRETTA_ARCH_SUFFIX=aarch64-linux-15k16 \
-      -DBUILD_STATIC=ON \
-      -DNOLOG=1 \
+      -DDIRETTA_NOLOG=ON \
       ..
 make -j$(nproc)
 ```
 
 ### Architecture Variants
 
-| `ARCH_NAME` | Platform |
-|-------------|----------|
+| `DIRETTA_ARCH_SUFFIX` | Platform |
+|-----------------------|----------|
 | `x64-linux-15v2` | x86-64 baseline (no AVX2) |
 | `x64-linux-15v3` | x86-64 with AVX2 (default) |
 | `x64-linux-15v4` | x86-64 with AVX-512 |
@@ -177,7 +176,7 @@ make -j$(nproc)
 | `*-musl*` | musl libc variants (e.g. `aarch64-linux-15-musl`) |
 | `*-nolog` | SDK logging disabled (append to any variant) |
 
-#### How to determine your `ARCH_NAME`
+#### How to determine your `DIRETTA_ARCH_SUFFIX`
 
 **x86-64:**
 ```bash
@@ -197,9 +196,11 @@ getconf PAGE_SIZE
 
 **musl libc:** If your system uses musl instead of glibc (e.g. Alpine Linux), append `-musl` to the base variant.
 
-**Production build:** Append `-nolog` to disable SDK internal logging (e.g. `aarch64-linux-15-nolog`).
+**Production build:** Append `-nolog` to disable SDK internal logging (e.g. `aarch64-linux-15-nolog`), or pass `-DDIRETTA_NOLOG=ON`.
 
-Output: `scream2diretta-<ARCH_NAME>[-static]`
+**Static linking:** The CMake build produces a dynamically-linked executable by default. For a fully static binary, set `LDFLAGS` or use `scripts/install.sh --full`, which handles static linking and strips the binary.
+
+Output: `scream2diretta-<DIRETTA_ARCH_SUFFIX>` (e.g. `scream2diretta-aarch64-linux-15k16`)
 
 ---
 

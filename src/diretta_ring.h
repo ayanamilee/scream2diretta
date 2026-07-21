@@ -1,6 +1,6 @@
 // PCM-only SPSC ring buffer for the Scream → Diretta pipeline.
 //
-// Producer: receiver thread (rcv_network / rcv_pcap / rcv_shmem) calling push().
+// Producer: receiver thread (rcv_network) calling push().
 // Consumer: Diretta SDK send thread, via Sync::getNewStream() callback,
 //           which calls pop() / popSilence().
 //
@@ -181,22 +181,6 @@ public:
             std::memset(dest + take, m_silence.load(std::memory_order_acquire), len - take);
             m_underrunCount.fetch_add(1, std::memory_order_relaxed);
         }
-    }
-
-    // Discard up to `len` of the OLDEST queued bytes by advancing the read
-    // pointer. Caller must ensure `len` is whole-frame aligned. Returns the
-    // number of bytes actually discarded (clamped to currently available).
-    // Used by the startup queue cap (--startup-max-queue-ms) to bound startup
-    // latency on a fresh Sync open by dropping pre-open backlog instead of
-    // replaying it all.
-    size_t discardOldest(size_t len) {
-        if (m_size == 0 || len == 0) return 0;
-        size_t avail = available();
-        size_t take = (avail < len) ? avail : len;
-        if (take == 0) return 0;
-        size_t rp = m_readPos.load(std::memory_order_relaxed);
-        m_readPos.store((rp + take) & m_mask, std::memory_order_release);
-        return take;
     }
 
     // Stats accessors (read by anybody, atomic-safe).

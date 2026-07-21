@@ -1,6 +1,1 @@
-#cmakedefine01 PULSEAUDIO_ENABLE
-#cmakedefine01 ALSA_ENABLE
-#cmakedefine01 JACK_ENABLE
-#cmakedefine01 PCAP_ENABLE
-#cmakedefine01 SNDIO_ENABLE
 #cmakedefine01 DIRETTA_ENABLE

@@ -14,7 +14,7 @@ extern "C" {
  *
  * Current architecture (unified PCM queue):
  *
- *   Scream UDP / pcap / shmem receiver
+ *   Scream UDP receiver
  *     -> receiver_data_t {format, audio, audio_size}
  *     -> diretta_output_send()
  *     -> PcmRing (ordered, frame-aligned)                <- the unified queue
@@ -104,16 +104,8 @@ typedef struct diretta_config_s {
      * during which the Sync MUST output zero PCM after a fresh open. Acts as
      * a forced silent warmup that runs through real Diretta pull cycles --
      * letting the target / DAC settle on silence before any real PCM lands.
-     * 0 disables it (= default behaviour and the default). Range 0..2000.
-     *
-     *  optional hard cap on the unified queue fill (ms) while the
-     * startup mute is still active. 0 = no cap (= default behaviour and the
-     * default). When >0, before getNewStream has finished its mute window
-     * and before the prefill gate has opened, the receiver thread will
-     * drop oldest queued bytes down to this cap. Trades the very head of
-     * the track for a deterministic startup latency. */
+     * 0 disables it (= default behaviour and the default). Range 0..2000. */
     int startup_mute_ms;
-    int startup_max_queue_ms;
 
     /*  optional post-play startup "real delay" window (ms). When >0,
      * after the Sync has been play()'d and the prefill gate would normally
